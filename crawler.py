@@ -3,7 +3,7 @@ import os
 import re
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
-from serpapi import GoogleSearch
+
 import logging
 import PyPDF2
 import io
@@ -58,22 +58,21 @@ def search_pdfs(query):
     try:
         params = {
             "q": f"{query} filetype:pdf",
-            "api_key": SERPAPI_KEY,  # Using the hardcoded API key
+            "api_key": SERPAPI_KEY,
             "engine": "google",
-            "tbs": "qdr:y"  # Filter results for the last year
+            "tbs": "qdr:y",
+            "output": "json"
         }
-
-        search = GoogleSearch(params)
-        results = search.get_dict()
+        response = requests.get("https://serpapi.com/search", params=params, timeout=TIMEOUT)
+        response.raise_for_status()
+        results = response.json()
 
         pdf_links = []
         for result in results.get("organic_results", []):
             link = result.get("link")
             if link and link.endswith(".pdf"):
                 pdf_links.append(link)
-
         return pdf_links
-
     except Exception as e:
         logging.error(f"Error occurred while searching: {e}")
         print(f"Error occurred while searching: {e}")
