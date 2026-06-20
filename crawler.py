@@ -1,354 +1,268 @@
-import requests
+"""
+crawler.py — backend for Pact PDF search & download application.
+
+Public API (imported by pact.py):
+    search_pdfs(query, max_results) -> list[str]
+    preview_pdf(url)               -> PIL.Image.Image | None
+    validate_url(url)              -> bool
+    validate_pdf_file(file_path)   -> bool
+
+Changes from original:
+  - Removed PDFDownloaderApp class and all Tkinter UI code (ttk, messagebox,
+    filedialog, Listbox, etc.) — UI lives entirely in pact.py.
+  - Removed DownloadThread — pact.py manages its own ThreadPoolExecutor.
+  - Removed get_pdf_metadata / display_metadata — not used by pact.py.
+  - preview_pdf now returns a PIL.Image.Image instead of ImageTk.PhotoImage.
+    Converting to ImageTk must happen on the main thread; pact.py does this
+    in _update_preview_image which already runs via root.after(0, ...).
+  - validate_pdf_file upgraded from PyPDF2 (deprecated) to pypdf.
+  - Module-level imports only — no imports inside functions except pdf2image
+    (which is optional and has its own install message).
+  - retry logic added to search_pdfs with MAX_RETRIES from config.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
 import os
 import re
-import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
-
-import logging
-import PyPDF2
-import io
-from PIL import Image, ImageTk
-import threading
 import time
-from config import SERPAPI_KEY, DEFAULT_DOWNLOAD_DIR, MAX_RETRIES, TIMEOUT
+from urllib.parse import urlparse
 
-# Set up logging
-logging.basicConfig(
-    filename='app.log',
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+import requests
+
+from config import (
+    MAX_FILE_SIZE,
+    MAX_RETRIES,
+    SERPAPI_KEY,
+    TIMEOUT,
 )
 
-class DownloadThread(threading.Thread):
-    def __init__(self, url, save_path, progress_bar, root, callback):
-        super().__init__()
-        self.url = url
-        self.save_path = save_path
-        self.progress_bar = progress_bar
-        self.root = root
-        self.callback = callback
-        self._stop_event = threading.Event()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-    def stop(self):
-        self._stop_event.set()
+logging.basicConfig(
+    filename="app.log",
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
-    def run(self):
-        try:
-            response = requests.get(self.url, stream=True, timeout=TIMEOUT)
-            total_size = int(response.headers.get('Content-Length', 0))
-            downloaded_size = 0
+# ---------------------------------------------------------------------------
+# Optional heavy dependencies — detected once at import time
+# ---------------------------------------------------------------------------
 
-            with open(self.save_path, 'wb') as file:
-                for data in response.iter_content(chunk_size=1024):
-                    if self._stop_event.is_set():
-                        os.remove(self.save_path)
-                        self.callback(False, "Download cancelled")
-                        return
-                    file.write(data)
-                    downloaded_size += len(data)
-                    self.progress_bar['value'] = (downloaded_size / total_size) * 100
-                    self.root.update_idletasks()
-
-            self.callback(True, "Download completed successfully")
-        except Exception as e:
-            self.callback(False, f"Error downloading PDF: {str(e)}")
-
-# Function to search for PDFs using SerpApi
-def search_pdfs(query):
+try:
+    from pypdf import PdfReader as _PdfReader
+    _PYPDF_AVAILABLE = True
+except ImportError:
     try:
+        # Fallback: PyPDF2 still works if pypdf not installed
+        from PyPDF2 import PdfReader as _PdfReader  # type: ignore[no-redef]
+        _PYPDF_AVAILABLE = True
+    except ImportError:
+        _PYPDF_AVAILABLE = False
+        logging.warning("Neither pypdf nor PyPDF2 is installed — PDF validation disabled.")
+
+try:
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+    logging.warning("Pillow not installed — PDF preview disabled.")
+
+# pdf2image is checked lazily in preview_pdf (optional, needs poppler)
+
+# ---------------------------------------------------------------------------
+# Blocked domains for search results
+# ---------------------------------------------------------------------------
+
+_BLOCKED_DOMAINS = frozenset([
+    "pdfdrive.com",
+    "pdfroom.com",
+    "epdf.tips",
+    "yumpu.com",
+    "docplayer.net",
+    "scribd.com",
+])
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def search_pdfs(query: str, max_results: int = 50) -> list[str]:
+    """Search for PDFs via SerpApi and return a list of URLs.
+
+    Args:
+        query:       Search term (the filetype:pdf suffix is added automatically).
+        max_results: Cap on the number of URLs returned.
+
+    Returns:
+        List of PDF URLs, deduplicated and filtered.  Empty list on error.
+    """
+    all_pdf_links: list[str] = []
+    num_per_page = 20
+    pages_to_fetch = (max_results + num_per_page - 1) // num_per_page
+
+    for page in range(pages_to_fetch):
+        start = page * num_per_page
         params = {
             "q": f"{query} filetype:pdf",
             "api_key": SERPAPI_KEY,
             "engine": "google",
-            "tbs": "qdr:y",
-            "output": "json"
+            "num": num_per_page,
+            "start": start,
+            "output": "json",
         }
-        response = requests.get("https://serpapi.com/search", params=params, timeout=TIMEOUT)
-        response.raise_for_status()
+
+        response = _get_with_retry("https://serpapi.com/search", params=params)
+        if response is None:
+            break
+
         results = response.json()
+        organic_results = results.get("organic_results", [])
 
-        pdf_links = []
-        for result in results.get("organic_results", []):
+        for result in organic_results:
             link = result.get("link")
-            if link and link.endswith(".pdf"):
-                pdf_links.append(link)
-        return pdf_links
-    except Exception as e:
-        logging.error(f"Error occurred while searching: {e}")
-        print(f"Error occurred while searching: {e}")
-        return []
+            if not link:
+                continue
 
-# Function to clean and ensure a valid file name
-def clean_filename(filename):
-    """Ensure valid and clean file name."""
-    return re.sub(r'[\/:*?"<>|]', '_', filename)
+            lowered = link.lower()
 
-# Function to get PDF metadata (title, author)
-def get_pdf_metadata(url):
-    try:
-        response = requests.get(url)
-        pdf = PyPDF2.PdfFileReader(io.BytesIO(response.content))
-        metadata = pdf.getDocumentInfo()
-        title = metadata.title if metadata.title else "Unknown Title"
-        author = metadata.author if metadata.author else "Unknown Author"
-        return title, author
-    except Exception as e:
-        logging.error(f"Error retrieving metadata: {e}")
-        print(f"Error retrieving metadata: {e}")
-        return "Unknown Title", "Unknown Author"
+            looks_like_pdf = (
+                lowered.endswith(".pdf")
+                or ".pdf?" in lowered
+                or ".pdf#" in lowered
+                or result.get("file_type", "").lower() == "pdf"
+            )
+            if not looks_like_pdf:
+                continue
 
-# Function to preview the first page of the PDF (using PIL and pdf2image)
-def preview_pdf(url):
-    try:
-        response = requests.get(url)
-        pdf_file = io.BytesIO(response.content)
+            if any(blocked in lowered for blocked in _BLOCKED_DOMAINS):
+                continue
 
-        # Use PIL and pdf2image to convert the first page to an image
-        from pdf2image import convert_from_bytes
-        pages = convert_from_bytes(pdf_file.read(), first_page=1, last_page=1)
-        image = pages[0]
+            if link in all_pdf_links:
+                continue
 
-        # Convert image to Tkinter compatible format
-        image_tk = ImageTk.PhotoImage(image)
+            all_pdf_links.append(link)
+            if len(all_pdf_links) >= max_results:
+                break
 
-        return image_tk
-    except Exception as e:
-        logging.error(f"Error previewing PDF: {e}")
-        print(f"Error previewing PDF: {e}")
+        if len(all_pdf_links) >= max_results:
+            break
+
+        # SerpApi total_results is unreliable — stop when page is empty
+        if not organic_results:
+            break
+
+    return all_pdf_links[:max_results]
+
+
+def preview_pdf(url: str):
+    """Fetch the first page of a remote PDF and return it as a PIL Image.
+
+    Returns:
+        PIL.Image.Image on success, None on failure.
+
+    Note:
+        Returns PIL.Image, NOT ImageTk.PhotoImage.  The caller (pact.py's
+        _update_preview_image) must convert to ImageTk on the main thread.
+        Creating ImageTk objects off the main thread crashes Tkinter on most
+        platforms.
+    """
+    if not _PIL_AVAILABLE:
+        logging.error("preview_pdf: Pillow not installed.")
         return None
 
-# Function to display metadata
-def display_metadata(title, author):
-    metadata_window = tk.Toplevel()
-    metadata_window.title("PDF Metadata")
-    metadata_label = ttk.Label(metadata_window, text=f"Title: {title}\nAuthor: {author}", font=("Helvetica", 12))
-    metadata_label.pack(padx=10, pady=10)
+    try:
+        from pdf2image import convert_from_bytes  # optional — needs poppler
+    except ImportError:
+        logging.error(
+            "preview_pdf: pdf2image not installed. "
+            "Run: pip install pdf2image  (also requires poppler on your PATH)"
+        )
+        return None
 
-# Main GUI Application Class
-class PDFDownloaderApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("PDF Downloader")
-        self.root.geometry("800x600")
+    try:
+        response = _get_with_retry(url)
+        if response is None:
+            return None
 
-        # Initialize theme state (dark by default)
-        self.is_dark_theme = True
-        self.download_thread = None
+        pages = convert_from_bytes(response.content, first_page=1, last_page=1)
+        if not pages:
+            return None
 
-        # Apply initial dark theme
-        self.apply_theme()
+        return pages[0]  # PIL.Image.Image
 
-        # Folder selection
-        self.selected_directory = DEFAULT_DOWNLOAD_DIR
+    except Exception as exc:
+        logging.error(f"preview_pdf error: {exc}")
+        return None
 
-        # Create main frame
-        self.main_frame = ttk.Frame(root)
-        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Search term input field
-        self.search_term_label = ttk.Label(self.main_frame, text="Enter the name of the PDF:")
-        self.search_term_label.pack(pady=5)
-        self.search_term_entry = ttk.Entry(self.main_frame, width=50, font=("Helvetica", 12))
-        self.search_term_entry.pack(pady=5)
+def validate_url(url: str) -> bool:
+    """Return True if *url* is a well-formed http/https URL."""
+    try:
+        parsed = urlparse(url)
+        return bool(parsed.scheme and parsed.netloc) and parsed.scheme in ("http", "https")
+    except Exception:
+        return False
 
-        # Search Button
-        self.search_button = ttk.Button(self.main_frame, text="Search PDFs", command=self.search_pdfs)
-        self.search_button.pack(pady=10)
 
-        # Clear Search Button
-        self.clear_search_button = ttk.Button(self.main_frame, text="Clear Search", command=self.clear_search)
-        self.clear_search_button.pack(pady=5)
+def validate_pdf_file(file_path: str) -> bool:
+    """Return True if the file at *file_path* is a readable PDF.
 
-        # Listbox for PDF results
-        self.results_label = ttk.Label(self.main_frame, text="Found PDFs:")
-        self.results_label.pack(pady=5)
-        self.results_listbox = tk.Listbox(self.main_frame, width=80, height=10, font=("Helvetica", 10))
-        self.results_listbox.pack(pady=5)
+    Uses pypdf (or PyPDF2 as fallback).  If neither is installed, logs a
+    warning and returns True so downloads aren't silently discarded.
+    """
+    if not _PYPDF_AVAILABLE:
+        logging.warning("validate_pdf_file: no PDF library installed — skipping validation.")
+        return True
 
-        # Preview PDF Button
-        self.preview_button = ttk.Button(self.main_frame, text="Preview PDF", command=self.preview_selected_pdf)
-        self.preview_button.pack(pady=5)
+    try:
+        with open(file_path, "rb") as fh:
+            reader = _PdfReader(fh)
+            return len(reader.pages) > 0
+    except Exception as exc:
+        logging.error(f"validate_pdf_file: {exc}")
+        return False
 
-        # Download Button
-        self.download_button = ttk.Button(self.main_frame, text="Download PDF", command=self.download_pdf)
-        self.download_button.pack(pady=10)
 
-        # Cancel Download Button
-        self.cancel_button = ttk.Button(self.main_frame, text="Cancel Download", command=self.cancel_download, state=tk.DISABLED)
-        self.cancel_button.pack(pady=5)
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-        # Progress bar for downloading
-        self.progress = ttk.Progressbar(self.main_frame, length=200, mode='determinate')
-        self.progress.pack(pady=10)
+def clean_filename(filename: str) -> str:
+    """Strip characters that are illegal in file names on Windows/macOS/Linux."""
+    return re.sub(r'[\\/:*?"<>|]', "_", filename)
 
-        # Status bar
-        self.status_var = tk.StringVar()
-        self.status_var.set("Ready")
-        self.status_bar = ttk.Label(self.main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Folder selection button
-        self.select_folder_button = ttk.Button(self.main_frame, text="Select Folder", command=self.select_directory)
-        self.select_folder_button.pack(pady=10)
+def _get_with_retry(
+    url: str,
+    params: dict | None = None,
+    retries: int = MAX_RETRIES,
+) -> requests.Response | None:
+    """GET *url* with exponential back-off on transient failures.
 
-        # Search history label
-        self.search_history_label = ttk.Label(self.main_frame, text="Search History:")
-        self.search_history_label.pack(pady=5)
-
-        # History combobox (dropdown) for previous search terms
-        self.search_history_combobox = ttk.Combobox(self.main_frame, width=50, values=[], state="readonly", font=("Helvetica", 10))
-        self.search_history_combobox.pack(pady=5)
-
-        self.pdf_links = []
-
-        # Download history listbox
-        self.download_history_label = ttk.Label(self.main_frame, text="Download History:")
-        self.download_history_label.pack(pady=5)
-
-        self.download_history_listbox = tk.Listbox(self.main_frame, width=80, height=5, font=("Helvetica", 10))
-        self.download_history_listbox.pack(pady=5)
-
-        # Theme Switch Button
-        self.theme_switch_button = ttk.Button(self.main_frame, text="Switch Theme", command=self.switch_theme)
-        self.theme_switch_button.pack(pady=15)
-
-    def apply_theme(self):
-        """Apply the appropriate theme based on the state"""
-        if self.is_dark_theme:
-            self.style = ttk.Style()
-            self.style.theme_use("clam")
-            self.style.configure("TButton", background="#3e8e41", foreground="white", font=("Helvetica", 12))
-            self.style.configure("TLabel", font=("Helvetica", 12), background="#2b2b2b", foreground="white")
-            self.style.configure("TProgressbar", thickness=30, background="green")
-        else:
-            self.style = ttk.Style()
-            self.style.theme_use("clam")
-            self.style.configure("TButton", background="#f0f0f0", foreground="black", font=("Helvetica", 12))
-            self.style.configure("TLabel", font=("Helvetica", 12), background="#ffffff", foreground="black")
-            self.style.configure("TProgressbar", thickness=30, background="lightblue")
-
-        # Reconfigure the widgets after applying the theme
-        self.root.configure(bg="#2b2b2b" if self.is_dark_theme else "#ffffff")
-
-    def switch_theme(self):
-        """Switch between dark and light themes"""
-        self.is_dark_theme = not self.is_dark_theme
-        self.apply_theme()
-
-    def select_directory(self):
-        folder_selected = filedialog.askdirectory()
-        if folder_selected:
-            self.selected_directory = folder_selected
-            print(f"Selected Directory: {self.selected_directory}")
-        else:
-            messagebox.showwarning("No Folder", "No folder selected.")
-
-    def preview_selected_pdf(self):
-        selected_index = self.results_listbox.curselection()
-        if selected_index:
-            selected_link = self.pdf_links[selected_index[0]]
-            image = preview_pdf(selected_link)
-
-            if image:
-                preview_window = tk.Toplevel(self.root)
-                preview_window.title("PDF Preview")
-                preview_label = ttk.Label(preview_window, image=image)
-                preview_label.pack(padx=10, pady=10)
-                preview_window.mainloop()
-            else:
-                messagebox.showerror("Preview Error", "Failed to preview the PDF.")
-        else:
-            messagebox.showwarning("No Selection", "Please select a PDF to preview.")
-
-    def clear_search(self):
-        self.results_listbox.delete(0, tk.END)
-        self.pdf_links = []
-        self.status_var.set("Search results cleared")
-
-    def cancel_download(self):
-        if self.download_thread and self.download_thread.is_alive():
-            self.download_thread.stop()
-            self.cancel_button.config(state=tk.DISABLED)
-            self.download_button.config(state=tk.NORMAL)
-            self.status_var.set("Download cancelled")
-
-    def download_callback(self, success, message):
-        self.status_var.set(message)
-        self.cancel_button.config(state=tk.DISABLED)
-        self.download_button.config(state=tk.NORMAL)
-        if success:
-            messagebox.showinfo("Success", message)
-        else:
-            messagebox.showerror("Error", message)
-
-    def download_pdf(self):
-        selected_index = self.results_listbox.curselection()
-        if selected_index:
-            selected_link = self.pdf_links[selected_index[0]]
-            file_name = os.path.basename(selected_link)
-            save_path = os.path.join(self.selected_directory if self.selected_directory else ".", file_name)
-
-            # Initialize the progress bar
-            self.progress['value'] = 0
-            self.download_button.config(state=tk.DISABLED)
-            self.cancel_button.config(state=tk.NORMAL)
-            self.status_var.set("Downloading...")
-
-            # Start download in a separate thread
-            self.download_thread = DownloadThread(
-                selected_link,
-                save_path,
-                self.progress,
-                self.root,
-                self.download_callback
-            )
-            self.download_thread.start()
-
-            # Add to download history
-            self.download_history_listbox.insert(tk.END, file_name)
-        else:
-            messagebox.showwarning("No Selection", "Please select a PDF to download.")
-
-    def search_pdfs(self):
-        search_term = self.search_term_entry.get().strip()
-        if not search_term:
-            messagebox.showwarning("Empty Search", "Please enter a search term")
-            return
-
-        # Add search term to history
-        self.add_to_search_history(search_term)
-
-        # Clear previous search results
-        self.results_listbox.delete(0, tk.END)
-        self.status_var.set("Searching...")
-
-        # Start search in a separate thread
-        threading.Thread(target=self._perform_search, args=(search_term,), daemon=True).start()
-
-    def _perform_search(self, search_term):
+    Returns the Response on success, None if all retries are exhausted.
+    """
+    for attempt in range(retries):
         try:
-            pdf_links = search_pdfs(search_term)
-            self.root.after(0, self._update_search_results, pdf_links)
-        except Exception as e:
-            self.root.after(0, lambda: self.status_var.set(f"Search error: {str(e)}"))
+            response = requests.get(url, params=params, timeout=TIMEOUT)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as exc:
+            # 4xx errors won't be fixed by retrying
+            if exc.response is not None and exc.response.status_code < 500:
+                logging.error(f"_get_with_retry: non-retryable HTTP {exc.response.status_code} for {url}")
+                return None
+            logging.warning(f"_get_with_retry: attempt {attempt + 1} failed ({exc})")
+        except requests.exceptions.RequestException as exc:
+            logging.warning(f"_get_with_retry: attempt {attempt + 1} failed ({exc})")
 
-    def _update_search_results(self, pdf_links):
-        if pdf_links:
-            self.pdf_links = pdf_links
-            for idx, link in enumerate(pdf_links):
-                self.results_listbox.insert(tk.END, f"{idx + 1}. {link}")
-            self.status_var.set(f"Found {len(pdf_links)} PDFs")
-        else:
-            self.status_var.set("No PDFs found")
-            messagebox.showinfo("No Results", "No PDFs found. Please try another search term.")
+        if attempt < retries - 1:
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s …
 
-    def add_to_search_history(self, search_term):
-        # Add search term to history list
-        if search_term not in self.search_history_combobox['values']:
-            self.search_history_combobox['values'] = list(self.search_history_combobox['values']) + [search_term]
-
-# Create the main window and run the app
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = PDFDownloaderApp(root)
-    root.mainloop()
+    logging.error(f"_get_with_retry: all {retries} attempts failed for {url}")
+    return None
