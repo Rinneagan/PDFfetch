@@ -16,17 +16,17 @@ DisableDirPage=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-OutputDir=c:\Users\AvaricE\Documents\PDFfetch\dist
+OutputDir=dist
 OutputBaseFilename=PactInstaller
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 
 ; Branding and Wizard Aesthetics
-SetupIconFile=c:\Users\AvaricE\Documents\PDFfetch\assets\Pact.ico
-WizardImageFile=c:\Users\AvaricE\Documents\PDFfetch\assets\wizard_image.bmp
-WizardSmallImageFile=c:\Users\AvaricE\Documents\PDFfetch\assets\wizard_small_image.bmp
-LicenseFile=c:\Users\AvaricE\Documents\PDFfetch\LICENSE.txt
+SetupIconFile=assets\Pact.ico
+WizardImageFile=assets\wizard_image.bmp
+WizardSmallImageFile=assets\wizard_small_image.bmp
+LicenseFile=LICENSE.txt
 DisableWelcomePage=no
 
 [Languages]
@@ -36,8 +36,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "c:\Users\AvaricE\Documents\PDFfetch\dist\Pact.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "c:\Users\AvaricE\Documents\PDFfetch\dist\.env"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\Pact.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\.env"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
