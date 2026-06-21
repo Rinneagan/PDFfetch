@@ -54,6 +54,7 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 try:
+    # pyrefly: ignore [missing-import]
     from pypdf import PdfReader as _PdfReader
     _PYPDF_AVAILABLE = True
 except ImportError:
@@ -102,6 +103,9 @@ def search_pdfs(query: str, max_results: int = 50) -> list[str]:
     Returns:
         List of PDF URLs, deduplicated and filtered.  Empty list on error.
     """
+    if not SERPAPI_KEY:
+        raise ValueError("SERPAPI_KEY environment variable is not set. Please set it in your .env file.")
+
     all_pdf_links: list[str] = []
     num_per_page = 20
     pages_to_fetch = (max_results + num_per_page - 1) // num_per_page

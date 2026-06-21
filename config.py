@@ -5,9 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # API Configuration
-SERPAPI_KEY = os.getenv('SERPAPI_KEY')
-if not SERPAPI_KEY:
-    raise ValueError("SERPAPI_KEY environment variable is not set. Please create a .env file with your API key.")
+SERPAPI_KEY = os.getenv('SERPAPI_KEY', '')
 
 # Application Settings
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser('~'), 'Documents')
