@@ -1,5 +1,9 @@
 # Pact
 
+<p align="center">
+  <img src="assets/Black.png" alt="Pact Logo" width="320" style="border-radius: 8px;"/>
+</p>
+
 A premium, secure desktop application for searching, previewing, downloading, and reading PDF files. The application is built on a modern hybrid stack: a robust **Python backend** (for API coordination, file processing, and local database stores) bound to a stunning **HTML5/CSS3/JavaScript frontend** with a glassmorphic aesthetic served locally via **`pywebview`**.
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
