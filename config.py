@@ -1,28 +1,46 @@
 import os
 import sys
-from dotenv import load_dotenv
+import dotenv
 
-# Load environment variables from multiple possible .env locations:
-# 1. User home profile .pact directory
+# Load environment variables from multiple possible .env locations with fallback and priorities:
+# Priority (highest to lowest):
+# 1. OS environment variables (pre-set)
+# 2. User home profile directory (~/.pact/.env)
+# 3. Executable directory (or script directory in dev)
+# 4. Current working directory (.env)
+
 pact_dir = os.path.join(os.path.expanduser("~"), ".pact")
 user_env_path = os.path.join(pact_dir, ".env")
-if os.path.exists(user_env_path):
-    load_dotenv(user_env_path)
 
-# 2. Executable directory (or script directory in dev)
 if getattr(sys, 'frozen', False):
     exe_dir = os.path.dirname(sys.executable)
 else:
     exe_dir = os.path.dirname(os.path.abspath(__file__))
-
 exe_env_path = os.path.join(exe_dir, ".env")
-if os.path.exists(exe_env_path):
-    load_dotenv(exe_env_path)
 
-# 3. Current working directory fallback
-load_dotenv()
+cwd_env_path = os.path.abspath(".env")
 
-# API Configuration
+def read_env_keys(path: str) -> dict[str, str]:
+    """Read key-value pairs from a .env file, ignoring empty values."""
+    if os.path.exists(path):
+        try:
+            vals = dotenv.dotenv_values(path)
+            return {k: v for k, v in vals.items() if v is not None and v.strip() != ""}
+        except Exception:
+            pass
+    return {}
+
+# Merge envs (lowest to highest priority, so later overrides earlier)
+merged_env = {}
+merged_env.update(read_env_keys(cwd_env_path))
+merged_env.update(read_env_keys(exe_env_path))
+merged_env.update(read_env_keys(user_env_path))
+
+# Apply merged environment variables to os.environ
+for k, v in merged_env.items():
+    os.environ[k] = v
+
+# API Configuration (System env has final priority)
 SERPAPI_KEY = os.getenv('SERPAPI_KEY', '')
 
 # Application Settings
